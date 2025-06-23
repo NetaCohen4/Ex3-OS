@@ -1,15 +1,18 @@
 CXX = g++
 CXXFLAGS = -Wall -Wextra -std=c++17
 
-TARGETS = CH client
+TARGETS = client server
 
 all: $(TARGETS)
 
-CH: CH.cpp
-	$(CXX) $(CXXFLAGS) -o CH CH.cpp
+# CH: CH.cpp
+# 	$(CXX) $(CXXFLAGS) -o CH CH.cpp
 
-client: client.cpp
-	$(CXX) $(CXXFLAGS) -o client client.cpp
+server: server.cpp
+	$(CXX) $(CXXFLAGS) -o server server.cpp
+
+client1: client.cpp
+	$(CXX) $(CXXFLAGS) -o client1 client1.cpp
 
 clean:
 	rm -f $(TARGETS)
