@@ -1,10 +1,10 @@
 CXX = g++
-CXXFLAGS = -Wall -pthread -std=c++11 -I../Ex5
+CXXFLAGS = -Wall -g -pthread -std=c++11 -I../Ex5
 
-all: server_test client
+all: server client
 
-server_test: server_test.cpp
-	$(CXX) $(CXXFLAGS) -o server_test server_test.cpp -L../Ex5 -lreac
+server: server.cpp
+	$(CXX) $(CXXFLAGS) -o server server.cpp -L../Ex5 -lreac
 
 client: client.cpp
 	$(CXX) $(CXXFLAGS) -o client client.cpp

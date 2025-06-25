@@ -10,9 +10,21 @@
 #include <cstring>
 #include <pthread.h>
 #include <stdio.h>
+#include "Reactor.hpp"
+#include <pthread.h>
+#include <unistd.h>
+#include <set>
+#include <mutex>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <cstdio>
 
 // Function pointer type for reactor callbacks
 typedef void* (*reactorFunc)(int fd);
+
+// פונקציית callback פר לקוח
+typedef void* (*proactorFunc)(int sockfd);
 
 // Reactor structure
 struct Reactor {
@@ -29,6 +41,91 @@ struct Reactor {
         pthread_mutex_destroy(&mutex);
     }
 };
+
+struct Proactor {
+    int listener_fd;
+    proactorFunc handlerFunc;
+    bool running;
+    pthread_t thread;
+    std::mutex graph_mutex;  // להגנה על משאבים משותפים
+    std::set<pthread_t> client_threads;
+};
+
+// Thread per connection
+void* handle_connection_thread(void* arg) {
+    auto* data = static_cast<std::pair<proactorFunc, int>*>(arg);
+    proactorFunc func = data->first;
+    int client_fd = data->second;
+    delete data;
+
+    if (func) func(client_fd);
+    close(client_fd);
+    return nullptr;
+}
+
+void* proactor_loop(void* arg) {
+    Proactor* p = static_cast<Proactor*>(arg);
+
+    while (p->running) {
+        struct sockaddr_in client_addr;
+        socklen_t client_len = sizeof(client_addr);
+
+        int client_fd = accept(p->listener_fd, (struct sockaddr*)&client_addr, &client_len);
+        if (client_fd < 0) {
+            perror("accept");
+            continue;
+        }
+
+        pthread_t tid;
+        auto* args = new std::pair<proactorFunc, int>(p->handlerFunc, client_fd);
+        if (pthread_create(&tid, nullptr, handle_connection_thread, args) == 0) {
+            std::lock_guard<std::mutex> lock(p->graph_mutex);
+            p->client_threads.insert(tid);
+        } else {
+            perror("pthread_create");
+            delete args;
+            close(client_fd);
+        }
+    }
+
+    return nullptr;
+}
+
+// Start the proactor on given socket and callback
+pthread_t startProactor(int sockfd, proactorFunc threadFunc) {
+    Proactor* p = new Proactor();
+    p->listener_fd = sockfd;
+    p->handlerFunc = threadFunc;
+    p->running = true;
+
+    if (pthread_create(&p->thread, nullptr, proactor_loop, p) != 0) {
+        perror("pthread_create");
+        delete p;
+        return 0;
+    }
+
+    return p->thread;
+}
+
+// Stop the proactor by thread id
+int stopProactor(pthread_t tid) {
+    // We assume the Proactor object is accessible by thread id
+    // For real system, consider keeping mapping tid -> Proactor*
+    // This implementation just cancels the thread for simplicity
+
+    if (pthread_cancel(tid) != 0) {
+        perror("pthread_cancel");
+        return -1;
+    }
+
+    if (pthread_join(tid, nullptr) != 0) {
+        perror("pthread_join");
+        return -1;
+    }
+
+    return 0;
+}
+
 
 // Internal reactor loop function (select)
 void* reactorFunction(void* reactor_ptr) {
@@ -61,8 +158,8 @@ void* reactorFunction(void* reactor_ptr) {
         } else if (result == 0) {
             continue;
         }
-
-        // *** חשוב: לעבור על עותק של ה־fds ***
+        
+        // Copy fds to avoid holding the mutex while processing
         pthread_mutex_lock(&reactor->mutex);
         std::vector<int> fds_copy = reactor->fds;
         pthread_mutex_unlock(&reactor->mutex);
@@ -76,48 +173,6 @@ void* reactorFunction(void* reactor_ptr) {
                 if (func) func(fd);
             }
         }
-    }
-    return nullptr;
-}
-
-// Internal reactor loop function (poll)
-void* reactorFunctionPoll(void* reactor_ptr) {
-    Reactor* reactor = static_cast<Reactor*>(reactor_ptr);
-    while (reactor->running) {
-        if (reactor->fds.empty()) {
-            usleep(1000); // 1ms
-            continue;
-        }
-
-        std::vector<struct pollfd> pollfds;
-        pthread_mutex_lock(&reactor->mutex);
-        for (int fd : reactor->fds) {
-            struct pollfd pfd;
-            pfd.fd = fd;
-            pfd.events = POLLIN;
-            pfd.revents = 0;
-            pollfds.push_back(pfd);
-        }
-        pthread_mutex_unlock(&reactor->mutex);
-
-        int result = poll(pollfds.data(), pollfds.size(), 1000);
-        if (result == -1) {
-            perror("poll");
-            break;
-        } else if (result == 0) {
-            continue;
-        }
-
-        pthread_mutex_lock(&reactor->mutex);
-        for (const auto& pfd : pollfds) {
-            if (pfd.revents & POLLIN) {
-                auto it = reactor->reactorFuncs.find(pfd.fd);
-                if (it != reactor->reactorFuncs.end() && it->second != nullptr) {
-                    it->second(pfd.fd);
-                }
-            }
-        }
-        pthread_mutex_unlock(&reactor->mutex);
     }
     return nullptr;
 }
@@ -175,14 +230,5 @@ int stopReactor(void* reactor) {
     return 0;
 }
 
-// Optional: Run the reactor loop (blocking, can be used instead of thread)
-void runReactor(void* reactor) {
-    if (reactor == nullptr) return;
-    #ifdef USE_POLL
-        reactorFunctionPoll(reactor);
-    #else
-        reactorFunction(reactor);
-    #endif
-}
 
 #endif // REACTOR_HPP

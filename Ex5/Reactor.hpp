@@ -19,7 +19,5 @@ int removeFdFromReactor(void* reactor, int fd);
 // Stops reactor
 int stopReactor(void* reactor);
 
-// Optional: Run the reactor loop (blocking, can be used instead of thread)
-void runReactor(void* reactor);
 
 #endif // REACTOR_HPP

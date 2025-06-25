@@ -8,10 +8,9 @@
 #include <unistd.h>
 #include <algorithm>
 #include <cstring>
-#include <stdio.h>
 #include <pthread.h>
-
-
+#include <stdio.h>
+#include "Reactor.hpp"
 
 // Function pointer type for reactor callbacks
 typedef void* (*reactorFunc)(int fd);
@@ -21,194 +20,119 @@ struct Reactor {
     std::vector<int> fds;                    // List of file descriptors
     std::map<int, reactorFunc> reactorFuncs; // Map fd -> function
     bool running;                            // Reactor state
-    int max_fd;                             // Maximum fd for select
-    
-    Reactor() : running(false), max_fd(0) {}
+    pthread_t thread;                        // Thread running the reactor loop
+    pthread_mutex_t mutex;                   // Protect fds and reactorFuncs
+
+    Reactor() : running(false) {
+        pthread_mutex_init(&mutex, nullptr);
+    }
+    ~Reactor() {
+        pthread_mutex_destroy(&mutex);
+    }
 };
 
-// Forward declarations
-void* startReactor();
-int addFdToReactor(void* reactor, int fd, reactorFunc func);
-int removeFdFromReactor(void* reactor, int fd);
-int stopReactor(void* reactor);
-
-// Internal reactor loop function
+// Internal reactor loop function (select)
 void* reactorFunction(void* reactor_ptr) {
     Reactor* reactor = static_cast<Reactor*>(reactor_ptr);
-    
     while (reactor->running) {
         if (reactor->fds.empty()) {
-            // No file descriptors to monitor, sleep briefly
-            usleep(1000); // 1ms
+            usleep(1000);
             continue;
         }
-        
+
         fd_set readfds;
         FD_ZERO(&readfds);
-        
-        // Add all fds to the select set
         int max_fd = 0;
+
+        pthread_mutex_lock(&reactor->mutex);
         for (int fd : reactor->fds) {
             FD_SET(fd, &readfds);
-            if (fd > max_fd) {
-                max_fd = fd;
-            }
+            if (fd > max_fd) max_fd = fd;
         }
-        reactor->max_fd = max_fd;
-        
-        // Set timeout for select (1 second)
+        pthread_mutex_unlock(&reactor->mutex);
+
         struct timeval tv;
         tv.tv_sec = 1;
         tv.tv_usec = 0;
-        
+
         int result = select(max_fd + 1, &readfds, NULL, NULL, &tv);
-        
         if (result == -1) {
             perror("select");
             break;
         } else if (result == 0) {
-            // Timeout, continue loop
             continue;
         }
         
-        // Check which fds are ready and call their functions
-        for (int fd : reactor->fds) {
-            if (FD_ISSET(fd, &readfds)) {
-                auto it = reactor->reactorFuncs.find(fd);
-                if (it != reactor->reactorFuncs.end() && it->second != nullptr) {
-                    it->second(fd);
-                }
-            }
-        }
-    }
-    
-    return nullptr;
-}
+        // Copy fds to avoid holding the mutex while processing
+        pthread_mutex_lock(&reactor->mutex);
+        std::vector<int> fds_copy = reactor->fds;
+        pthread_mutex_unlock(&reactor->mutex);
 
-// Alternative reactor implementation using poll()
-void* reactorFunctionPoll(void* reactor_ptr) {
-    Reactor* reactor = static_cast<Reactor*>(reactor_ptr);
-    
-    while (reactor->running) {
-        if (reactor->fds.empty()) {
-            usleep(1000); // 1ms
-            continue;
-        }
-        
-        // Prepare pollfd array
-        std::vector<struct pollfd> pollfds;
-        for (int fd : reactor->fds) {
-            struct pollfd pfd;
-            pfd.fd = fd;
-            pfd.events = POLLIN;
-            pfd.revents = 0;
-            pollfds.push_back(pfd);
-        }
-        
-        // Poll with 1 second timeout
-        int result = poll(pollfds.data(), pollfds.size(), 1000);
-        
-        if (result == -1) {
-            perror("poll");
-            break;
-        } else if (result == 0) {
-            // Timeout, continue loop
-            continue;
-        }
-        
-        // Check which fds are ready and call their functions
-        for (const auto& pfd : pollfds) {
-            if (pfd.revents & POLLIN) {
-                auto it = reactor->reactorFuncs.find(pfd.fd);
-                if (it != reactor->reactorFuncs.end() && it->second != nullptr) {
-                    it->second(pfd.fd);
-                }
+        for (int fd : fds_copy) {
+            if (FD_ISSET(fd, &readfds)) {
+                pthread_mutex_lock(&reactor->mutex);
+                auto it = reactor->reactorFuncs.find(fd);
+                reactorFunc func = (it != reactor->reactorFuncs.end()) ? it->second : nullptr;
+                pthread_mutex_unlock(&reactor->mutex);
+                if (func) func(fd);
             }
         }
     }
-    
     return nullptr;
 }
 
 // Starts new reactor and returns pointer to it
 void* startReactor() {
     Reactor* reactor = new Reactor();
-    if (!reactor) return nullptr;
-
     reactor->running = true;
-
+    if (pthread_create(&reactor->thread, nullptr, reactorFunction, reactor) != 0) {
+        delete reactor;
+        return nullptr;
+    }
     return static_cast<void*>(reactor);
 }
 
 // Adds fd to Reactor (for reading); returns 0 on success
 int addFdToReactor(void* reactor, int fd, reactorFunc func) {
-    if (reactor == nullptr || func == nullptr) {
-        return -1;
-    }
-    
+    if (reactor == nullptr || func == nullptr) return -1;
     Reactor* r = static_cast<Reactor*>(reactor);
-    
-    // Check if fd already exists
+    pthread_mutex_lock(&r->mutex);
     auto it = std::find(r->fds.begin(), r->fds.end(), fd);
     if (it != r->fds.end()) {
-        return -1; // fd already exists
+        pthread_mutex_unlock(&r->mutex);
+        return -1;
     }
-    
     r->fds.push_back(fd);
     r->reactorFuncs[fd] = func;
-    
+    pthread_mutex_unlock(&r->mutex);
     return 0;
 }
 
 // Removes fd from reactor
 int removeFdFromReactor(void* reactor, int fd) {
-    if (reactor == nullptr) {
-        return -1;
-    }
-    
+    if (reactor == nullptr) return -1;
     Reactor* r = static_cast<Reactor*>(reactor);
-    
-    // Remove from fds vector
+    pthread_mutex_lock(&r->mutex);
     auto it = std::find(r->fds.begin(), r->fds.end(), fd);
     if (it == r->fds.end()) {
-        return -1; // fd not found
+        pthread_mutex_unlock(&r->mutex);
+        return -1;
     }
-    
     r->fds.erase(it);
     r->reactorFuncs.erase(fd);
-    
+    pthread_mutex_unlock(&r->mutex);
     return 0;
 }
 
 // Stops reactor
 int stopReactor(void* reactor) {
-    if (reactor == nullptr) {
-        return -1;
-    }
-    
+    if (reactor == nullptr) return -1;
     Reactor* r = static_cast<Reactor*>(reactor);
     r->running = false;
-    
-    // Clean up
-    r->fds.clear();
-    r->reactorFuncs.clear();
-    
+    pthread_join(r->thread, nullptr);
     delete r;
     return 0;
 }
 
-// Run the reactor loop (blocking call)
-void runReactor(void* reactor) {
-    if (reactor == nullptr) {
-        return;
-    }
-    
-    // Choose between select and poll implementation
-    #ifdef USE_POLL
-        reactorFunctionPoll(reactor);
-    #else
-        reactorFunction(reactor);
-    #endif
-}
 
 #endif // REACTOR_HPP

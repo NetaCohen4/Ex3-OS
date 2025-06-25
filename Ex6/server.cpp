@@ -1,160 +1,282 @@
-#include "../Ex5/Reactor.hpp"
+#include <iostream>
 #include <vector>
-#include <set>
-#include <map>
 #include <string>
 #include <sstream>
-#include <iostream>
+#include <algorithm>
+#include <cmath>
+#include <sys/socket.h>
 #include <netinet/in.h>
+#include <arpa/inet.h>
 #include <unistd.h>
 #include <cstring>
-#include <algorithm>
+#include <map>
+#include "../Ex5/Reactor.hpp" // או "reactor.hpp" אם הוא בתיקיה הנוכחית
 
-#define PORT 9034
+void* reactor_ptr = nullptr; // גלובלי עבור removeFdFromReactor
 
-void* reactor = startReactor();
 
-// ------------------ מבנה נתונים לגרף ------------------
 struct Point {
-    float x, y;
+    double x, y;
+    Point(double x = 0, double y = 0) : x(x), y(y) {}
     bool operator<(const Point& other) const {
         if (x != other.x) return x < other.x;
         return y < other.y;
     }
+    bool operator==(const Point& other) const {
+        return std::abs(x - other.x) < 1e-9 && std::abs(y - other.y) < 1e-9;
+    }
 };
 
-std::set<Point> graph;
+std::vector<Point> graph;
 
-// ------------------ פונקציות עזר ------------------
-float cross(const Point& O, const Point& A, const Point& B) {
-    return (A.x - O.x) * (B.y - O.y) - (A.y - O.y) * (B.x - O.x);
+// Cross product for orientation
+double cross(const Point& o, const Point& a, const Point& b) {
+    return (a.x - o.x) * (b.y - o.y) - (a.y - o.y) * (b.x - o.x);
 }
 
-std::vector<Point> convex_hull(const std::set<Point>& pts) {
-    std::vector<Point> points(pts.begin(), pts.end()), hull;
-    int n = points.size(), k = 0;
-    if (n == 0) return hull;
-    hull.resize(2 * n);
-    std::sort(points.begin(), points.end(), [](const Point& a, const Point& b) {
-        return (a.x < b.x) || (a.x == b.x && a.y < b.y);
+// Convex Hull using Graham Scan
+std::vector<Point> convexHull(std::vector<Point> points) {
+    if (points.size() <= 1) return points;
+    int min_idx = 0;
+    for (int i = 1; i < (int)points.size(); i++) {
+        if (points[i].y < points[min_idx].y || 
+            (points[i].y == points[min_idx].y && points[i].x < points[min_idx].x)) {
+            min_idx = i;
+        }
+    }
+    std::swap(points[0], points[min_idx]);
+    Point pivot = points[0];
+    std::sort(points.begin() + 1, points.end(), [&](const Point& a, const Point& b) {
+        double cross_prod = cross(pivot, a, b);
+        if (cross_prod == 0) {
+            double dist_a = (a.x - pivot.x) * (a.x - pivot.x) + (a.y - pivot.y) * (a.y - pivot.y);
+            double dist_b = (b.x - pivot.x) * (b.x - pivot.x) + (b.y - pivot.y) * (b.y - pivot.y);
+            return dist_a < dist_b;
+        }
+        return cross_prod > 0;
     });
-    // Lower hull
-    for (int i = 0; i < n; ++i) {
-        while (k >= 2 && cross(hull[k-2], hull[k-1], points[i]) <= 0) k--;
-        hull[k++] = points[i];
+    std::vector<Point> hull;
+    for (const Point& p : points) {
+        while (hull.size() >= 2 && cross(hull[hull.size()-2], hull[hull.size()-1], p) < 0) {
+            hull.pop_back();
+        }
+        hull.push_back(p);
     }
-    // Upper hull
-    for (int i = n-2, t = k+1; i >= 0; --i) {
-        while (k >= t && cross(hull[k-2], hull[k-1], points[i]) <= 0) k--;
-        hull[k++] = points[i];
-    }
-    hull.resize(k-1);
     return hull;
 }
 
-float polygon_area(const std::vector<Point>& hull) {
-    float area = 0;
+// Calculate area of convex hull
+double calculateArea(const std::vector<Point>& hull) {
+    if (hull.size() < 3) return 0.0;
+    double area = 0.0;
     int n = hull.size();
-    for (int i = 0; i < n; ++i) {
-        area += hull[i].x * hull[(i+1)%n].y - hull[(i+1)%n].x * hull[i].y;
+    for (int i = 0; i < n; i++) {
+        int j = (i + 1) % n;
+        area += hull[i].x * hull[j].y;
+        area -= hull[j].x * hull[i].y;
     }
-    return std::abs(area) / 2.0f;
+    return std::abs(area) / 2.0;
 }
 
-// ------------------ עיבוד פקודות ------------------
-void process_command(const std::string& cmd, int client_fd) {
-    std::istringstream iss(cmd);
-    std::string op;
-    iss >> op;
-    if (op == "Newgraph") {
-        int n; iss >> n;
-        graph.clear();
-        for (int i = 0; i < n; ++i) {
-            std::string line;
-            std::getline(iss, line); // אם יש בשורה, אחרת תקרא מהקלט
-            if (line.empty()) std::getline(std::cin, line);
-            std::istringstream lss(line);
-            float x, y; char comma;
-            lss >> x >> comma >> y;
-            graph.insert({x, y});
+// Client data structure
+struct ClientData {
+    std::string buffer;
+    ClientData() {}
+};
+std::map<int, ClientData> clients;
+
+struct ClientState {
+    bool waiting_for_points = false;
+    int points_remaining = 0;
+};
+std::map<int, ClientState> client_states;
+
+void processCommand(int client_fd, const std::string& command) {
+    std::istringstream iss(command);
+    std::string cmd;
+    iss >> cmd;
+
+    if (client_states[client_fd].waiting_for_points) {
+        size_t comma_pos = command.find(',');
+        if (comma_pos != std::string::npos) {
+            try {
+                double x = std::stod(command.substr(0, comma_pos));
+                double y = std::stod(command.substr(comma_pos + 1));
+                graph.push_back(Point(x, y));
+                client_states[client_fd].points_remaining--;
+                if (client_states[client_fd].points_remaining == 0) {
+                    client_states[client_fd].waiting_for_points = false;
+                    std::string response = "Graph created with " + std::to_string(graph.size()) + " points\n";
+                    send(client_fd, response.c_str(), response.length(), 0);
+                }
+            } catch (...) {
+                std::string error = "Invalid point format\n";
+                send(client_fd, error.c_str(), error.length(), 0);
+                client_states[client_fd].waiting_for_points = false;
+            }
         }
-        std::string resp = "OK\n";
-        send(client_fd, resp.c_str(), resp.size(), 0);
+        return;
     }
-    else if (op == "Newpoint") {
-        float x, y; char comma;
-        iss >> x >> comma >> y;
-        graph.insert({x, y});
-        std::string resp = "OK\n";
-        send(client_fd, resp.c_str(), resp.size(), 0);
-    }
-    else if (op == "Removepoint") {
-        float x, y; char comma;
-        iss >> x >> comma >> y;
-        graph.erase({x, y});
-        std::string resp = "OK\n";
-        send(client_fd, resp.c_str(), resp.size(), 0);
-    }
-    else if (op == "CH") {
-        auto hull = convex_hull(graph);
-        float area = polygon_area(hull);
-        std::ostringstream oss;
-        oss << area << "\n";
-        std::string resp = oss.str();
-        send(client_fd, resp.c_str(), resp.size(), 0);
-    }
-    else {
-        std::string resp = "Unknown command\n";
-        send(client_fd, resp.c_str(), resp.size(), 0);
+
+    if (cmd == "Newgraph") {
+        int n;
+        if (iss >> n) {
+            graph.clear();
+            if (n > 0) {
+                client_states[client_fd].waiting_for_points = true;
+                client_states[client_fd].points_remaining = n;
+                std::string response = "Ready to receive " + std::to_string(n) + " points. Send them as x,y format:\n";
+                send(client_fd, response.c_str(), response.length(), 0);
+            } else {
+                std::string response = "Empty graph created\n";
+                send(client_fd, response.c_str(), response.length(), 0);
+            }
+        } else {
+            std::string error = "Invalid Newgraph command format\n";
+            send(client_fd, error.c_str(), error.length(), 0);
+        }
+    } else if (cmd == "CH") {
+        std::vector<Point> hull = convexHull(graph);
+        double area = calculateArea(hull);
+        std::string response = std::to_string(area) + "\n";
+        send(client_fd, response.c_str(), response.length(), 0);
+    } else if (cmd == "Newpoint") {
+        std::string coords;
+        iss >> coords;
+        size_t comma_pos = coords.find(',');
+        if (comma_pos != std::string::npos) {
+            try {
+                double x = std::stod(coords.substr(0, comma_pos));
+                double y = std::stod(coords.substr(comma_pos + 1));
+                graph.push_back(Point(x, y));
+                std::string response = "Point added\n";
+                send(client_fd, response.c_str(), response.length(), 0);
+            } catch (...) {
+                std::string error = "Invalid point format\n";
+                send(client_fd, error.c_str(), error.length(), 0);
+            }
+        } else {
+            std::string error = "Invalid point format\n";
+            send(client_fd, error.c_str(), error.length(), 0);
+        }
+    } else if (cmd == "Removepoint") {
+        std::string coords;
+        iss >> coords;
+        size_t comma_pos = coords.find(',');
+        if (comma_pos != std::string::npos) {
+            try {
+                double x = std::stod(coords.substr(0, comma_pos));
+                double y = std::stod(coords.substr(comma_pos + 1));
+                auto it = std::find(graph.begin(), graph.end(), Point(x, y));
+                if (it != graph.end()) {
+                    graph.erase(it);
+                    std::string response = "Point removed\n";
+                    send(client_fd, response.c_str(), response.length(), 0);
+                } else {
+                    std::string response = "Point not found\n";
+                    send(client_fd, response.c_str(), response.length(), 0);
+                }
+            } catch (...) {
+                std::string error = "Invalid point format\n";
+                send(client_fd, error.c_str(), error.length(), 0);
+            }
+        } else {
+            std::string error = "Invalid point format\n";
+            send(client_fd, error.c_str(), error.length(), 0);
+        }
+    } else {
+        size_t comma_pos = command.find(',');
+        if (comma_pos != std::string::npos) {
+            try {
+                double x = std::stod(command.substr(0, comma_pos));
+                double y = std::stod(command.substr(comma_pos + 1));
+                graph.push_back(Point(x, y));
+                std::string response = "Point added\n";
+                send(client_fd, response.c_str(), response.length(), 0);
+            } catch (...) {
+                std::string error = "Unknown command or invalid format\n";
+                send(client_fd, error.c_str(), error.length(), 0);
+            }
+        } else {
+            std::string error = "Unknown command\n";
+            send(client_fd, error.c_str(), error.length(), 0);
+        }
     }
 }
 
-// ------------------ callback ללקוח ------------------
-void* client_callback(int fd) {
-    char buf[1024] = {0};
-    int bytes = recv(fd, buf, sizeof(buf)-1, 0);
+void* clientCallback(int client_fd) {
+    char buffer[1024];
+    ssize_t bytes = recv(client_fd, buffer, sizeof(buffer) - 1, 0);
     if (bytes <= 0) {
-        close(fd);
-        // הסר fd מה־reactor (צריך גישה ל־reactor)
-        // removeFdFromReactor(reactor, fd);
+        if (bytes == 0) {
+            std::cout << "Client " << client_fd << " disconnected normally\n";
+        } else {
+            perror("recv");
+        }
+        clients.erase(client_fd);
+        client_states.erase(client_fd);
+        removeFdFromReactor(reactor_ptr, client_fd);
+        close(client_fd);
         return nullptr;
     }
-    std::string cmd(buf);
-    cmd.erase(std::remove(cmd.begin(), cmd.end(), '\r'), cmd.end());
-    cmd.erase(std::remove(cmd.begin(), cmd.end(), '\n'), cmd.end());
-    process_command(cmd, fd);
+    buffer[bytes] = '\0';
+    clients[client_fd].buffer += buffer;
+    size_t pos;
+    while ((pos = clients[client_fd].buffer.find('\n')) != std::string::npos) {
+        std::string command = clients[client_fd].buffer.substr(0, pos);
+        clients[client_fd].buffer.erase(0, pos + 1);
+        if (!command.empty() && command.back() == '\r') command.pop_back();
+        processCommand(client_fd, command);
+    }
     return nullptr;
 }
 
-// ------------------ callback ל־accept ------------------
-void* accept_callback(int listen_fd) {
+void* acceptCallback(int listen_fd) {
+    std::cout << "Accepting new client connection...\n";
     sockaddr_in client_addr;
     socklen_t addrlen = sizeof(client_addr);
     int client_fd = accept(listen_fd, (sockaddr*)&client_addr, &addrlen);
-    if (client_fd >= 0) {
-        // הוסף את הלקוח החדש ל־reactor
-        addFdToReactor(reactor, client_fd, client_callback);
+    if (client_fd < 0) {
+        perror("accept");
+        return nullptr;
     }
+    clients[client_fd] = ClientData();
+    addFdToReactor(reactor_ptr, client_fd, clientCallback);
+    std::cout << "New client connected: " << client_fd << "\n";
     return nullptr;
 }
 
-// ------------------ main ------------------
 int main() {
     int listen_fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (listen_fd < 0) {
+        perror("socket");
+        return 1;
+    }
     sockaddr_in addr;
     addr.sin_family = AF_INET;
     addr.sin_addr.s_addr = INADDR_ANY;
-    addr.sin_port = htons(PORT);
-    bind(listen_fd, (sockaddr*)&addr, sizeof(addr));
-    listen(listen_fd, 10);
+    addr.sin_port = htons(9034);
+    if (bind(listen_fd, (sockaddr*)&addr, sizeof(addr)) < 0) {
+        perror("bind");
+        close(listen_fd);
+        return 1;
+    }
+    if (listen(listen_fd, 10) < 0) {
+        perror("listen");
+        close(listen_fd);
+        return 1;
+    }
 
-    addFdToReactor(reactor, listen_fd, accept_callback);
+    reactor_ptr = startReactor();
+    addFdToReactor(reactor_ptr, listen_fd, acceptCallback);
 
-    // לולאה ראשית - ה־reactor רץ ב־thread משלו
+    std::cout << "Server running on port 9034\n";
     while (true) {
         sleep(1);
     }
-    stopReactor(reactor);
+
+    // לא יגיע לכאן בדרך כלל, אבל אפשר להוסיף ניקוי בסיום
+    stopReactor(reactor_ptr);
     close(listen_fd);
     return 0;
 }
