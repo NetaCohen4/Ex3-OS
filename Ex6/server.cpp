@@ -10,10 +10,9 @@
 #include <unistd.h>
 #include <cstring>
 #include <map>
-#include "../Ex5/Reactor.hpp" // או "reactor.hpp" אם הוא בתיקיה הנוכחית
+#include "../Ex5/Reactor.hpp"
 
-void* reactor_ptr = nullptr; // גלובלי עבור removeFdFromReactor
-
+void* reactor_ptr = nullptr; // Global for removeFdFromReactor
 
 struct Point {
     double x, y;
@@ -275,7 +274,6 @@ int main() {
         sleep(1);
     }
 
-    // לא יגיע לכאן בדרך כלל, אבל אפשר להוסיף ניקוי בסיום
     stopReactor(reactor_ptr);
     close(listen_fd);
     return 0;

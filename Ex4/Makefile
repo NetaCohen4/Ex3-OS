@@ -5,9 +5,6 @@ TARGETS = client server
 
 all: $(TARGETS)
 
-# CH: CH.cpp
-# 	$(CXX) $(CXXFLAGS) -o CH CH.cpp
-
 server: server.cpp
 	$(CXX) $(CXXFLAGS) -o server server.cpp
 

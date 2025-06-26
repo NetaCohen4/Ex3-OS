@@ -1,5 +1,3 @@
-# reactor/Makefile
-
 CXX = g++
 CXXFLAGS = -Wall -std=c++17 -pthread -O2
 AR = ar

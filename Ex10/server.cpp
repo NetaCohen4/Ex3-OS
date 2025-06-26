@@ -12,8 +12,10 @@
 #include <map>
 #include <set>
 #include <pthread.h>
+#include "../Ex8/Reactor.hpp"
 
-// מבנה נקודה
+
+// Point structure 
 struct Point {
     double x, y;
     Point(double x = 0, double y = 0) : x(x), y(y) {}
@@ -26,11 +28,13 @@ struct Point {
     }
 };
 
-// משתנים גלובליים
+// Global variables 
 std::vector<Point> graph;
 pthread_mutex_t graph_mutex = PTHREAD_MUTEX_INITIALIZER;
+pthread_cond_t ch_area_cond = PTHREAD_COND_INITIALIZER;
+bool area_above_100 = false;
 
-// פונקציות עזר לחישוב קמור
+// Helper functions for convex hull calculation
 double cross(const Point& O, const Point& A, const Point& B) {
     return (A.x - O.x) * (B.y - O.y) - (A.y - O.y) * (B.x - O.x);
 }
@@ -77,16 +81,8 @@ double calculateArea(const std::vector<Point>& hull) {
     return std::abs(area) / 2.0;
 }
 
-// struct for threads
-struct ClientData {
-    int client_fd;
-    pthread_t thread_id;
-};
-
-void* handleClient(void* arg) {
-    int client_fd = *((int*)arg);
-    delete (int*)arg; // שחרור הזיכרון
-    
+// Handler for client connections
+void* client_handler(int client_fd) {
     char buffer[1024];
     std::string client_buffer;
     bool waiting_for_points = false;
@@ -121,8 +117,10 @@ void* handleClient(void* arg) {
                     try {
                         double x = std::stod(command.substr(0, comma_pos));
                         double y = std::stod(command.substr(comma_pos + 1));
+                        
                         graph.push_back(Point(x, y));
                         points_remaining--;
+                        
                         if (points_remaining == 0) {
                             waiting_for_points = false;
                             std::string response = "Graph created with " + std::to_string(graph.size()) + " points\n";
@@ -137,8 +135,10 @@ void* handleClient(void* arg) {
                     }
                 }
             }
+
             else if (cmd == "Newgraph") {
                 pthread_mutex_lock(&graph_mutex);
+                area_above_100 = false; // Reset area flag
                 int n;
                 if (iss >> n) {
                     graph.clear();
@@ -150,10 +150,12 @@ void* handleClient(void* arg) {
                     } else {
                         std::string response = "Empty graph created\n";
                         send(client_fd, response.c_str(), response.length(), 0);
+                        pthread_mutex_unlock(&graph_mutex);
                     }
                 } else {
                     std::string error = "Invalid Newgraph command format\n";
                     send(client_fd, error.c_str(), error.length(), 0);
+                    pthread_mutex_unlock(&graph_mutex);
                 }
             }
             else if (cmd == "CH") {
@@ -162,6 +164,7 @@ void* handleClient(void* arg) {
                 double area = calculateArea(hull);
                 std::string response = std::to_string(area) + "\n";
                 send(client_fd, response.c_str(), response.length(), 0);
+                pthread_cond_signal(&ch_area_cond);
                 pthread_mutex_unlock(&graph_mutex);
             }
             else if (cmd == "Newpoint") {
@@ -179,7 +182,6 @@ void* handleClient(void* arg) {
                     } catch (...) {
                         std::string error = "Invalid point format\n";
                         send(client_fd, error.c_str(), error.length(), 0);
-                        pthread_mutex_unlock(&graph_mutex);
                     }
                 } else {
                     std::string error = "Invalid point format\n";
@@ -201,6 +203,7 @@ void* handleClient(void* arg) {
                             graph.erase(it);
                             std::string response = "Point removed\n";
                             send(client_fd, response.c_str(), response.length(), 0);
+                            pthread_cond_signal(&ch_area_cond);
                         } else {
                             std::string response = "Point not found\n";
                             send(client_fd, response.c_str(), response.length(), 0);
@@ -208,7 +211,6 @@ void* handleClient(void* arg) {
                     } catch (...) {
                         std::string error = "Invalid point format\n";
                         send(client_fd, error.c_str(), error.length(), 0);
-                        pthread_mutex_unlock(&graph_mutex);
                     }
                 } else {
                     std::string error = "Invalid point format\n";
@@ -220,11 +222,33 @@ void* handleClient(void* arg) {
                 std::string error = "Unknown command\n";
                 send(client_fd, error.c_str(), error.length(), 0);
             }
-            
         }
     }
-    
-    close(client_fd);
+
+    return nullptr;
+}
+
+
+void* ch_monitor_thread(void*) {
+    std::vector<Point> local_copy;
+    while (true) {
+        pthread_mutex_lock(&graph_mutex);
+        pthread_cond_wait(&ch_area_cond, &graph_mutex); // wait for signal from client handler
+        
+        local_copy = graph;
+        std::vector<Point> hull = convexHull(local_copy);
+        double area = calculateArea(hull);
+        
+        if (area >= 100.0 && !area_above_100) {
+            std::cout << "At Least 100 units belongs to CH\n";
+            area_above_100 = true;
+        } else if (area < 100.0 && area_above_100) {
+            std::cout << "At Least 100 units no longer belongs to CH\n";
+            area_above_100 = false;
+        }
+
+        pthread_mutex_unlock(&graph_mutex);
+    }
     return nullptr;
 }
 
@@ -234,8 +258,8 @@ int main() {
         perror("socket");
         return 1;
     }
-    
-    // אפשר שימוש חוזר בפורט
+
+    // allowing reuse of port
     int opt = 1;
     setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
     
@@ -258,32 +282,29 @@ int main() {
     
     std::cout << "Server running on port 9034\n";
     
-    while (true) {
-        sockaddr_in client_addr;
-        socklen_t addrlen = sizeof(client_addr);
-        int client_fd = accept(listen_fd, (sockaddr*)&client_addr, &addrlen);
-        
-        if (client_fd < 0) {
-            perror("accept");
-            continue;
-        }
-        
-        std::cout << "New client connected: " << client_fd << "\n";
-        
-        // יצירת טרד חדש עבור הלקוח
-        pthread_t thread_id;
-        int* client_fd_ptr = new int(client_fd); // העברת pointer לטרד
-        
-        if (pthread_create(&thread_id, nullptr, handleClient, client_fd_ptr) != 0) {
-            perror("pthread_create");
-            close(client_fd);
-            delete client_fd_ptr;
-        } else {
-            pthread_detach(thread_id); // לא נצטרך להצטרף לטרד
-        }
+    // starting the Proactor
+    pthread_t proactor_tid = startProactor(listen_fd, client_handler);
+    if (proactor_tid == 0) {
+        std::cerr << "Failed to start proactor\n";
+        close(listen_fd);
+        return 1;
     }
     
+    pthread_t ch_tid;
+    if (pthread_create(&ch_tid, nullptr, ch_monitor_thread, nullptr) != 0) {
+        perror("pthread_create ch_monitor_thread");
+        return 1;
+    }
+
+    // Waiting for the proactor to run
+    while (true) {
+        sleep(1);
+    }
+    
+    // cleanup
+    stopProactor(proactor_tid);
     close(listen_fd);
     pthread_mutex_destroy(&graph_mutex);
+    pthread_cond_destroy(&ch_area_cond);
     return 0;
 }

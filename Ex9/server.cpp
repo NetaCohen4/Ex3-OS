@@ -12,8 +12,9 @@
 #include <map>
 #include <set>
 #include <pthread.h>
+#include "../Ex8/Reactor.hpp"
 
-// Point structure
+// Point structure 
 struct Point {
     double x, y;
     Point(double x = 0, double y = 0) : x(x), y(y) {}
@@ -26,7 +27,7 @@ struct Point {
     }
 };
 
-// Global variables
+// Global variables 
 std::vector<Point> graph;
 pthread_mutex_t graph_mutex = PTHREAD_MUTEX_INITIALIZER;
 
@@ -77,16 +78,8 @@ double calculateArea(const std::vector<Point>& hull) {
     return std::abs(area) / 2.0;
 }
 
-// struct for threads
-struct ClientData {
-    int client_fd;
-    pthread_t thread_id;
-};
-
-void* handleClient(void* arg) {
-    int client_fd = *((int*)arg);
-    delete (int*)arg; // Free the memory
-
+// Handler for client connections
+void* client_handler(int client_fd) {
     char buffer[1024];
     std::string client_buffer;
     bool waiting_for_points = false;
@@ -121,8 +114,10 @@ void* handleClient(void* arg) {
                     try {
                         double x = std::stod(command.substr(0, comma_pos));
                         double y = std::stod(command.substr(comma_pos + 1));
+                        
                         graph.push_back(Point(x, y));
                         points_remaining--;
+                        
                         if (points_remaining == 0) {
                             waiting_for_points = false;
                             std::string response = "Graph created with " + std::to_string(graph.size()) + " points\n";
@@ -137,6 +132,7 @@ void* handleClient(void* arg) {
                     }
                 }
             }
+
             else if (cmd == "Newgraph") {
                 pthread_mutex_lock(&graph_mutex);
                 int n;
@@ -179,7 +175,6 @@ void* handleClient(void* arg) {
                     } catch (...) {
                         std::string error = "Invalid point format\n";
                         send(client_fd, error.c_str(), error.length(), 0);
-                        pthread_mutex_unlock(&graph_mutex);
                     }
                 } else {
                     std::string error = "Invalid point format\n";
@@ -208,7 +203,6 @@ void* handleClient(void* arg) {
                     } catch (...) {
                         std::string error = "Invalid point format\n";
                         send(client_fd, error.c_str(), error.length(), 0);
-                        pthread_mutex_unlock(&graph_mutex);
                     }
                 } else {
                     std::string error = "Invalid point format\n";
@@ -220,11 +214,10 @@ void* handleClient(void* arg) {
                 std::string error = "Unknown command\n";
                 send(client_fd, error.c_str(), error.length(), 0);
             }
-            
         }
     }
-    
-    close(client_fd);
+
+    // The server shutdown is handled by the Proactor
     return nullptr;
 }
 
@@ -257,32 +250,23 @@ int main() {
     }
     
     std::cout << "Server running on port 9034\n";
+
+    // Starting the Proactor
+    pthread_t proactor_tid = startProactor(listen_fd, client_handler);
     
-    while (true) {
-        sockaddr_in client_addr;
-        socklen_t addrlen = sizeof(client_addr);
-        int client_fd = accept(listen_fd, (sockaddr*)&client_addr, &addrlen);
-        
-        if (client_fd < 0) {
-            perror("accept");
-            continue;
-        }
-        
-        std::cout << "New client connected: " << client_fd << "\n";
-
-        // Creating a new thread for the client
-        pthread_t thread_id;
-        int* client_fd_ptr = new int(client_fd); // Passing pointer to thread
-
-        if (pthread_create(&thread_id, nullptr, handleClient, client_fd_ptr) != 0) {
-            perror("pthread_create");
-            close(client_fd);
-            delete client_fd_ptr;
-        } else {
-            pthread_detach(thread_id); // No need to join the thread
-        }
+    if (proactor_tid == 0) {
+        std::cerr << "Failed to start proactor\n";
+        close(listen_fd);
+        return 1;
     }
-    
+
+    // Waiting for the Proactor to run
+    while (true) {
+        sleep(1);
+    }
+
+    // Cleanup on exit (should not reach here)
+    stopProactor(proactor_tid);
     close(listen_fd);
     pthread_mutex_destroy(&graph_mutex);
     return 0;

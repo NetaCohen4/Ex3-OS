@@ -19,6 +19,8 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <cstdio>
+#include <iostream>
+using namespace std;
 
 // Function pointer type for reactor callbacks
 typedef void* (*reactorFunc)(int fd);
@@ -47,7 +49,7 @@ struct Proactor {
     proactorFunc handlerFunc;
     bool running;
     pthread_t thread;
-    std::mutex graph_mutex;  // להגנה על משאבים משותפים
+    std::mutex graph_mutex;  // Protect shared resources
     std::set<pthread_t> client_threads;
 };
 
@@ -75,6 +77,7 @@ void* proactor_loop(void* arg) {
             perror("accept");
             continue;
         }
+        std::cout << "New client accepted, fd: " << client_fd << std::endl;
 
         pthread_t tid;
         auto* args = new std::pair<proactorFunc, int>(p->handlerFunc, client_fd);
@@ -109,9 +112,6 @@ pthread_t startProactor(int sockfd, proactorFunc threadFunc) {
 
 // Stop the proactor by thread id
 int stopProactor(pthread_t tid) {
-    // We assume the Proactor object is accessible by thread id
-    // For real system, consider keeping mapping tid -> Proactor*
-    // This implementation just cancels the thread for simplicity
 
     if (pthread_cancel(tid) != 0) {
         perror("pthread_cancel");

@@ -226,7 +226,7 @@ void handle_new_connection(int listener, int *fd_count, int *fd_size, struct pol
 }
 
 // Handle regular client data or client hangups
-void handle_client_data(int listener, int *fd_count, struct pollfd *pfds, int *pfd_i) {
+void handle_client_data(int *fd_count, struct pollfd *pfds, int *pfd_i) {
     char buf[1024]; // Buffer for client data
     int nbytes = recv(pfds[*pfd_i].fd, buf, sizeof buf - 1, 0);
     int sender_fd = pfds[*pfd_i].fd;
@@ -276,7 +276,7 @@ void process_connections(int listener, int *fd_count, int *fd_size, struct pollf
                 handle_new_connection(listener, fd_count, fd_size, pfds);
             } else {
                 // Otherwise we're just a regular client
-                handle_client_data(listener, fd_count, *pfds, &i);
+                handle_client_data(fd_count, *pfds, &i);
             }
         }
     }
